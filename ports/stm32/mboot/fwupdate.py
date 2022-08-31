@@ -75,12 +75,10 @@ def dfu_read(filename):
         return None
 
     hdr = f.read(16)
-    crc = crc32(hdr[:-4], crc)
-    hdr = struct.unpack("<HHHH3sBI", hdr)
-
+    crc = crc32(hdr, crc)
     crc = ~crc & 0xFFFFFFFF
-    if crc != hdr[-1]:
-        print("CRC failed", crc, hdr[-1])
+    if crc != 0:
+        print("CRC failed", crc)
         return None
 
     return elems
@@ -105,10 +103,11 @@ class Flash:
             dev_id = 0
 
         # Configure flash parameters based on MCU.
-        if dev_id in (0x413, 0x419, 0x431, 0x451, 0x452):
+        if dev_id in (0x413, 0x419, 0x431, 0x434, 0x451, 0x452):
             # 0x413: STM32F405/407, STM32F415/417
             # 0x419: STM32F42x/43x
             # 0x431: STM32F411
+            # 0x434: STM32F469/479
             # 0x451: STM32F76x/77x
             # 0x452: STM32F72x/73x
             self._keyr = stm.FLASH + stm.FLASH_KEYR
@@ -155,7 +154,6 @@ class Flash:
         stm.mem32[self._cr] = self._cr_lock
 
     def erase_sector(self, sector):
-        assert 0 <= sector <= 7
         self.wait_not_busy()
         stm.mem32[self._cr] = self._cr_init_erase(sector)
         stm.mem32[self._cr] |= self._cr_start_erase
@@ -227,7 +225,9 @@ def _create_element(kind, body):
     return bytes([kind, len(body)]) + body
 
 
-def update_mpy(filename, fs_base, fs_len, fs_type=VFS_FAT, fs_blocksize=0, status_addr=None):
+def update_app_elements(
+    filename, fs_base, fs_len, fs_type=VFS_FAT, fs_blocksize=0, status_addr=None, addr_64bit=False
+):
     # Check firmware is of .dfu or .dfu.gz type
     try:
         with open(filename, "rb") as f:
@@ -237,15 +237,16 @@ def update_mpy(filename, fs_base, fs_len, fs_type=VFS_FAT, fs_blocksize=0, statu
             hdr = f.read(6)
     if hdr != b"DfuSe\x01":
         print("Firmware must be a .dfu(.gz) file.")
-        return
+        return ()
 
     if fs_type in (VFS_LFS1, VFS_LFS2) and not fs_blocksize:
         raise Exception("littlefs requires fs_blocksize parameter")
 
     mount_point = 1
+    mount_encoding = "<BBQQL" if addr_64bit else "<BBLLL"
     elems = _create_element(
         _ELEM_TYPE_MOUNT,
-        struct.pack("<BBLLL", mount_point, fs_type, fs_base, fs_len, fs_blocksize),
+        struct.pack(mount_encoding, mount_point, fs_type, fs_base, fs_len, fs_blocksize),
     )
     elems += _create_element(
         _ELEM_TYPE_FSLOAD, struct.pack("<B", mount_point) + bytes(filename, "ascii")
@@ -255,4 +256,10 @@ def update_mpy(filename, fs_base, fs_len, fs_type=VFS_FAT, fs_blocksize=0, statu
         machine.mem32[status_addr] = 1
         elems += _create_element(_ELEM_TYPE_STATUS, struct.pack("<L", status_addr))
     elems += _create_element(_ELEM_TYPE_END, b"")
-    machine.bootloader(elems)
+    return elems
+
+
+def update_mpy(*args, **kwargs):
+    elems = update_app_elements(*args, **kwargs)
+    if elems:
+        machine.bootloader(elems)

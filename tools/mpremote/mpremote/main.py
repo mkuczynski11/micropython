@@ -1,6 +1,6 @@
 """
 MicroPython Remote - Interaction and automation tool for MicroPython
-MIT license; Copyright (c) 2019-2021 Damien P. George
+MIT license; Copyright (c) 2019-2022 Damien P. George
 
 This program provides a set of utilities to interact with and automate a
 MicroPython device over a serial connection.  Commands supported are:
@@ -19,6 +19,7 @@ MicroPython device over a serial connection.  Commands supported are:
 
 import os, sys
 from collections.abc import Mapping
+import tempfile
 from textwrap import dedent
 
 import serial.tools.list_ports
@@ -28,6 +29,7 @@ from .console import Console, ConsolePosix
 
 _PROG = "mpremote"
 
+# (need_raw_repl, is_action, num_args_min, help_text)
 _COMMANDS = {
     "connect": (
         False,
@@ -39,7 +41,20 @@ _COMMANDS = {
         or any valid device name/path""",
     ),
     "disconnect": (False, False, 0, "disconnect current device"),
-    "mount": (True, False, 1, "mount local directory on device"),
+    "edit": (True, True, 1, "edit files on the device"),
+    "resume": (False, False, 0, "resume a previous mpremote session (will not auto soft-reset)"),
+    "soft-reset": (False, True, 0, "perform a soft-reset of the device"),
+    "mount": (
+        True,
+        False,
+        1,
+        """\
+        mount local directory on device
+        options:
+            --unsafe-links, -l
+                follow symbolic links pointing outside of local directory""",
+    ),
+    "umount": (True, False, 0, "unmount the local directory"),
     "repl": (
         False,
         True,
@@ -56,6 +71,7 @@ _COMMANDS = {
     "run": (True, True, 1, "run the given local script"),
     "fs": (True, True, 1, "execute filesystem commands on the device"),
     "help": (False, False, 0, "print help and exit"),
+    "version": (False, False, 0, "print version and exit"),
 }
 
 _BUILTIN_COMMAND_EXPANSIONS = {
@@ -69,6 +85,7 @@ _BUILTIN_COMMAND_EXPANSIONS = {
     "ls": "fs ls",
     "cp": "fs cp",
     "rm": "fs rm",
+    "touch": "fs touch",
     "mkdir": "fs mkdir",
     "rmdir": "fs rmdir",
     "df": [
@@ -96,6 +113,8 @@ _BUILTIN_COMMAND_EXPANSIONS = {
         "exec",
         "import machine; machine.RTC().datetime((2020, 1, 1, 0, 10, 0, 0, 0))",
     ],
+    "--help": "help",
+    "--version": "version",
 }
 
 for port_num in range(4):
@@ -264,21 +283,65 @@ def do_disconnect(pyb):
     pyb.close()
 
 
+def show_progress_bar(size, total_size):
+    if not sys.stdout.isatty():
+        return
+    verbose_size = 2048
+    bar_length = 20
+    if total_size < verbose_size:
+        return
+    elif size >= total_size:
+        # Clear progress bar when copy completes
+        print("\r" + " " * (20 + bar_length) + "\r", end="")
+    else:
+        progress = size / total_size
+        bar = round(progress * bar_length)
+        print(
+            "\r ... copying {:3.0f}% [{}{}]".format(
+                progress * 100, "#" * bar, "-" * (bar_length - bar)
+            ),
+            end="",
+        )
+
+
+# Get all args up to the terminator ("+").
+# The passed args will be updated with these ones removed.
+def get_fs_args(args):
+    n = 0
+    for src in args:
+        if src == "+":
+            break
+        n += 1
+    fs_args = args[:n]
+    args[:] = args[n + 1 :]
+    return fs_args
+
+
 def do_filesystem(pyb, args):
     def _list_recursive(files, path):
         if os.path.isdir(path):
             for entry in os.listdir(path):
-                _list_recursive(files, os.path.join(path, entry))
+                _list_recursive(files, "/".join((path, entry)))
         else:
             files.append(os.path.split(path))
 
-    if args[0] == "cp" and args[1] == "-r":
-        args.pop(0)
-        args.pop(0)
-        assert args[-1] == ":"
-        args.pop()
+    fs_args = get_fs_args(args)
+
+    # Don't be verbose when using cat, so output can be redirected to something.
+    verbose = fs_args[0] != "cat"
+
+    if fs_args[0] == "cp" and fs_args[1] == "-r":
+        fs_args.pop(0)
+        fs_args.pop(0)
+        if fs_args[-1] != ":":
+            print(f"{_PROG}: 'cp -r' destination must be ':'")
+            sys.exit(1)
+        fs_args.pop()
         src_files = []
-        for path in args:
+        for path in fs_args:
+            if path.startswith(":"):
+                print(f"{_PROG}: 'cp -r' source files must be local")
+                sys.exit(1)
             _list_recursive(src_files, path)
         known_dirs = {""}
         pyb.exec_("import uos")
@@ -289,10 +352,37 @@ def do_filesystem(pyb, args):
                 if d not in known_dirs:
                     pyb.exec_("try:\n uos.mkdir('%s')\nexcept OSError as e:\n print(e)" % d)
                     known_dirs.add(d)
-            pyboard.filesystem_command(pyb, ["cp", os.path.join(dir, file), ":" + dir + "/"])
+            pyboard.filesystem_command(
+                pyb,
+                ["cp", "/".join((dir, file)), ":" + dir + "/"],
+                progress_callback=show_progress_bar,
+                verbose=verbose,
+            )
     else:
-        pyboard.filesystem_command(pyb, args)
-    args.clear()
+        try:
+            pyboard.filesystem_command(
+                pyb, fs_args, progress_callback=show_progress_bar, verbose=verbose
+            )
+        except OSError as er:
+            print(f"{_PROG}: {er}")
+            sys.exit(1)
+
+
+def do_edit(pyb, args):
+    if not os.getenv("EDITOR"):
+        raise pyboard.PyboardError("edit: $EDITOR not set")
+    for src in get_fs_args(args):
+        src = src.lstrip(":")
+        dest_fd, dest = tempfile.mkstemp(suffix=os.path.basename(src))
+        try:
+            print("edit :%s" % (src,))
+            os.close(dest_fd)
+            pyb.fs_touch(src)
+            pyb.fs_get(src, dest, progress_callback=show_progress_bar)
+            if os.system("$EDITOR '%s'" % (dest,)) == 0:
+                pyb.fs_put(dest, src, progress_callback=show_progress_bar)
+        finally:
+            os.unlink(dest)
 
 
 def do_repl_main_loop(pyb, console_in, console_out_write, *, code_to_inject, file_to_inject):
@@ -303,8 +393,8 @@ def do_repl_main_loop(pyb, console_in, console_out_write, *, code_to_inject, fil
             if c == b"\x1d":  # ctrl-], quit
                 break
             elif c == b"\x04":  # ctrl-D
-                # do a soft reset and reload the filesystem hook
-                pyb.soft_reset_with_mount(console_out_write)
+                # special handling needed for ctrl-D if filesystem is mounted
+                pyb.write_ctrl_d(console_out_write)
             elif c == b"\x0a" and code_to_inject is not None:  # ctrl-j, inject code
                 pyb.serial.write(code_to_inject)
             elif c == b"\x0b" and file_to_inject is not None:  # ctrl-k, inject script
@@ -427,12 +517,19 @@ def print_help():
     print_commands_help(_command_expansions, 2)
 
 
+def print_version():
+    from . import __version__
+
+    print(f"{_PROG} {__version__}")
+
+
 def main():
     config = load_user_config()
     prepare_command_expansions(config)
 
     args = sys.argv[1:]
     pyb = None
+    auto_soft_reset = True
     did_action = False
 
     try:
@@ -459,13 +556,22 @@ def main():
             elif cmd == "help":
                 print_help()
                 sys.exit(0)
+            elif cmd == "version":
+                print_version()
+                sys.exit(0)
+            elif cmd == "resume":
+                auto_soft_reset = False
+                continue
+
+            # The following commands need a connection, and either a raw or friendly REPL.
 
             if pyb is None:
                 pyb = do_connect(["auto"])
 
             if need_raw_repl:
                 if not pyb.in_raw_repl:
-                    pyb.enter_raw_repl()
+                    pyb.enter_raw_repl(soft_reset=auto_soft_reset)
+                    auto_soft_reset = False
             else:
                 if pyb.in_raw_repl:
                     pyb.exit_raw_repl()
@@ -475,10 +581,20 @@ def main():
             if cmd == "disconnect":
                 do_disconnect(pyb)
                 pyb = None
+                auto_soft_reset = True
+            elif cmd == "soft-reset":
+                pyb.enter_raw_repl(soft_reset=True)
+                auto_soft_reset = False
             elif cmd == "mount":
+                unsafe_links = False
+                if args[0] == "--unsafe-links" or args[0] == "-l":
+                    args.pop(0)
+                    unsafe_links = True
                 path = args.pop(0)
-                pyb.mount_local(path)
+                pyb.mount_local(path, unsafe_links=unsafe_links)
                 print(f"Local directory {path} is mounted at /remote")
+            elif cmd == "umount":
+                pyb.umount_local()
             elif cmd in ("exec", "eval", "run"):
                 follow = True
                 if args[0] == "--no-follow":
@@ -501,6 +617,8 @@ def main():
                     return ret
             elif cmd == "fs":
                 do_filesystem(pyb, args)
+            elif cmd == "edit":
+                do_edit(pyb, args)
             elif cmd == "repl":
                 do_repl(pyb, args)
 

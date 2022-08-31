@@ -32,6 +32,7 @@
 #include "fsl_common.h"
 #include "fsl_lpuart.h"
 #include "fsl_iomuxc.h"
+#include CLOCK_CONFIG_H
 
 #define DEFAULT_UART_BAUDRATE (115200)
 #define DEFAULT_BUFFER_SIZE (256)
@@ -85,27 +86,15 @@ bool lpuart_set_iomux(int8_t uart) {
     if (TX.muxRegister != 0) {
         IOMUXC_SetPinMux(TX.muxRegister, TX.muxMode, TX.inputRegister, TX.inputDaisy, TX.configRegister, 0U);
         IOMUXC_SetPinConfig(TX.muxRegister, TX.muxMode, TX.inputRegister, TX.inputDaisy, TX.configRegister,
-            pin_generate_config(PIN_PULL_UP_100K, PIN_MODE_OUT, PIN_DRIVE_POWER_6, TX.configRegister));
+            pin_generate_config(PIN_PULL_UP_100K, PIN_MODE_OUT, PIN_DRIVE_6, TX.configRegister));
 
         IOMUXC_SetPinMux(RX.muxRegister, RX.muxMode, RX.inputRegister, RX.inputDaisy, RX.configRegister, 0U);
         IOMUXC_SetPinConfig(RX.muxRegister, RX.muxMode, RX.inputRegister, RX.inputDaisy, RX.configRegister,
-            pin_generate_config(PIN_PULL_UP_100K, PIN_MODE_IN, PIN_DRIVE_POWER_6, RX.configRegister));
+            pin_generate_config(PIN_PULL_UP_100K, PIN_MODE_IN, PIN_DRIVE_6, RX.configRegister));
         return true;
     } else {
         return false;
     }
-}
-
-uint32_t UART_SrcFreq(void) {
-    uint32_t freq;
-    // To make it simple, we assume default PLL and divider settings, and the
-    // only variable from application is use PLL3 source or OSC source.
-    if (CLOCK_GetMux(kCLOCK_UartMux) == 0) { // PLL3 div6 80M
-        freq = (CLOCK_GetPllFreq(kCLOCK_PllUsb1) / 6U) / (CLOCK_GetDiv(kCLOCK_UartDiv) + 1U);
-    } else {
-        freq = CLOCK_GetOscFreq() / (CLOCK_GetDiv(kCLOCK_UartDiv) + 1U);
-    }
-    return freq;
 }
 
 void LPUART_UserCallback(LPUART_Type *base, lpuart_handle_t *handle, status_t status, void *userData) {
@@ -219,7 +208,7 @@ STATIC mp_obj_t machine_uart_init_helper(machine_uart_obj_t *self, size_t n_args
     }
 
     // Initialise the UART peripheral if any arguments given, or it was not initialised previously.
-    if (n_args > 1 || self->new) {
+    if (n_args > 0 || kw_args->used > 0 || self->new) {
         self->new = false;
         // may be obsolete
         if (self->config.baudRate_Bps == 0) {
@@ -232,7 +221,7 @@ STATIC mp_obj_t machine_uart_init_helper(machine_uart_obj_t *self, size_t n_args
             self->timeout_char = min_timeout_char;
         }
 
-        LPUART_Init(self->lpuart, &self->config, UART_SrcFreq()); // ??
+        LPUART_Init(self->lpuart, &self->config, BOARD_BOOTCLOCKRUN_UART_CLK_ROOT); // ??
         LPUART_TransferCreateHandle(self->lpuart, &self->handle,  LPUART_UserCallback, self);
         uint8_t *buffer = m_new(uint8_t, rxbuf_len + 1);
         LPUART_TransferStartRingBuffer(self->lpuart, &self->handle, buffer, rxbuf_len);
@@ -277,8 +266,7 @@ STATIC mp_obj_t machine_uart_make_new(const mp_obj_type_t *type, size_t n_args, 
 
     // Create the UART object and fill it with defaults.
     uint8_t uart_hw_id = uart_index_table[uart_id];  // the hw uart number 1..n
-    machine_uart_obj_t *self = m_new_obj(machine_uart_obj_t);
-    self->base.type = &machine_uart_type;
+    machine_uart_obj_t *self = mp_obj_malloc(machine_uart_obj_t, &machine_uart_type);
     self->id = uart_id;
     self->lpuart = uart_base_ptr_table[uart_hw_id];
     self->invert = false;
@@ -320,17 +308,30 @@ STATIC mp_obj_t machine_uart_sendbreak(mp_obj_t self_in) {
 }
 STATIC MP_DEFINE_CONST_FUN_OBJ_1(machine_uart_sendbreak_obj, machine_uart_sendbreak);
 
+STATIC mp_obj_t machine_uart_txdone(mp_obj_t self_in) {
+    machine_uart_obj_t *self = MP_OBJ_TO_PTR(self_in);
+
+    if (self->tx_status == kStatus_LPUART_TxIdle) {
+        return mp_const_true;
+    } else {
+        return mp_const_false;
+    }
+}
+STATIC MP_DEFINE_CONST_FUN_OBJ_1(machine_uart_txdone_obj, machine_uart_txdone);
+
 STATIC const mp_rom_map_elem_t machine_uart_locals_dict_table[] = {
     { MP_ROM_QSTR(MP_QSTR_init), MP_ROM_PTR(&machine_uart_init_obj) },
 
     { MP_ROM_QSTR(MP_QSTR_any), MP_ROM_PTR(&machine_uart_any_obj) },
 
+    { MP_ROM_QSTR(MP_QSTR_flush), MP_ROM_PTR(&mp_stream_flush_obj) },
     { MP_ROM_QSTR(MP_QSTR_read), MP_ROM_PTR(&mp_stream_read_obj) },
     { MP_ROM_QSTR(MP_QSTR_readline), MP_ROM_PTR(&mp_stream_unbuffered_readline_obj) },
     { MP_ROM_QSTR(MP_QSTR_readinto), MP_ROM_PTR(&mp_stream_readinto_obj) },
     { MP_ROM_QSTR(MP_QSTR_write), MP_ROM_PTR(&mp_stream_write_obj) },
 
     { MP_ROM_QSTR(MP_QSTR_sendbreak), MP_ROM_PTR(&machine_uart_sendbreak_obj) },
+    { MP_ROM_QSTR(MP_QSTR_txdone), MP_ROM_PTR(&machine_uart_txdone_obj) },
 
     { MP_ROM_QSTR(MP_QSTR_INV_TX), MP_ROM_INT(UART_INVERT_TX) },
     { MP_ROM_QSTR(MP_QSTR_INV_RX), MP_ROM_INT(UART_INVERT_RX) },
@@ -445,6 +446,21 @@ STATIC mp_uint_t machine_uart_ioctl(mp_obj_t self_in, mp_uint_t request, mp_uint
         if ((flags & MP_STREAM_POLL_WR)) {
             ret |= MP_STREAM_POLL_WR;
         }
+    } else if (request == MP_STREAM_FLUSH) {
+        // The timeout is estimated using the buffer size and the baudrate.
+        // Take the worst case assumptions at 13 bit symbol size times 2.
+        uint64_t timeout = (uint64_t)(3 + self->txbuf_len) * 13000000ll * 2 /
+            self->config.baudRate_Bps + ticks_us64();
+
+        do {
+            if (machine_uart_txdone((mp_obj_t)self) == mp_const_true) {
+                return 0;
+            }
+            MICROPY_EVENT_POLL_HOOK
+        } while (ticks_us64() < timeout);
+
+        *errcode = MP_ETIMEDOUT;
+        ret = MP_STREAM_ERROR;
     } else {
         *errcode = MP_EINVAL;
         ret = MP_STREAM_ERROR;

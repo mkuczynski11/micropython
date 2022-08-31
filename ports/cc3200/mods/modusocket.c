@@ -489,7 +489,7 @@ STATIC MP_DEFINE_CONST_FUN_OBJ_2(socket_bind_obj, socket_bind);
 STATIC mp_obj_t socket_listen(size_t n_args, const mp_obj_t *args) {
     mod_network_socket_obj_t *self = args[0];
 
-    int32_t backlog = 0;
+    int32_t backlog = MICROPY_PY_USOCKET_LISTEN_BACKLOG_DEFAULT;
     if (n_args > 1) {
         backlog = mp_obj_get_int(args[1]);
         backlog = (backlog < 0) ? 0 : backlog;
@@ -581,7 +581,7 @@ STATIC mp_obj_t socket_recv(mp_obj_t self_in, mp_obj_t len_in) {
     }
     vstr.len = ret;
     vstr.buf[vstr.len] = '\0';
-    return mp_obj_new_str_from_vstr(&mp_type_bytes, &vstr);
+    return mp_obj_new_bytes_from_vstr(&vstr);
 }
 STATIC MP_DEFINE_CONST_FUN_OBJ_2(socket_recv_obj, socket_recv);
 
@@ -625,7 +625,7 @@ STATIC mp_obj_t socket_recvfrom(mp_obj_t self_in, mp_obj_t len_in) {
     } else {
         vstr.len = ret;
         vstr.buf[vstr.len] = '\0';
-        tuple[0] = mp_obj_new_str_from_vstr(&mp_type_bytes, &vstr);
+        tuple[0] = mp_obj_new_bytes_from_vstr(&vstr);
     }
     tuple[1] = netutils_format_inet_addr(ip, port, NETUTILS_LITTLE);
     return mp_obj_new_tuple(2, tuple);
@@ -816,3 +816,5 @@ const mp_obj_module_t mp_module_usocket = {
     .base = { &mp_type_module },
     .globals = (mp_obj_dict_t*)&mp_module_usocket_globals,
 };
+
+MP_REGISTER_MODULE(MP_QSTR_usocket, mp_module_usocket);

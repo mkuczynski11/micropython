@@ -42,7 +42,7 @@ static inline void adc_deselect_vbat(ADC_TypeDef *adc, uint32_t channel) {
     if (channel == ADC_CHANNEL_VBAT) {
         ADC_Common_TypeDef *adc_common;
 
-        #if defined(STM32F0) || defined(STM32WB)
+        #if defined(STM32F0) || defined(STM32G0) || defined(STM32WB)
         adc_common = ADC1_COMMON;
         #elif defined(STM32F4)
         adc_common = ADC_COMMON_REGISTER(0);
@@ -56,6 +56,8 @@ static inline void adc_deselect_vbat(ADC_TypeDef *adc, uint32_t channel) {
         adc_common = adc == ADC3 ? ADC3_COMMON : ADC12_COMMON;
         #elif defined(STM32L4)
         adc_common = __LL_ADC_COMMON_INSTANCE(0);
+        #elif defined(STM32WL)
+        adc_common = ADC_COMMON;
         #endif
 
         adc_common->CCR &= ~LL_ADC_PATH_INTERNAL_VBAT;
